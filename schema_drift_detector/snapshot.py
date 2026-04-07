@@ -26,6 +26,12 @@ def get_schema(engine: sqlalchemy.engine.Engine) -> dict[str, Any]:
     Returns:
         A dict keyed by table name, each value containing columns,
         primary keys, foreign keys, indexes, and unique constraints.
+
+    Raises:
+        sqlalchemy.exc.OperationalError: If the database cannot be reached
+            or the connection is refused.
+        sqlalchemy.exc.NoSuchTableError: If introspection encounters a table
+            that disappears mid-inspection (e.g. in a concurrent environment).
     """
     inspector = inspect(engine)
     schema: dict[str, Any] = {}
@@ -85,6 +91,29 @@ def schema_fingerprint(schema: dict[str, Any]) -> str:
     return hashlib.sha256(blob).hexdigest()[:12]
 
 
+def load_snapshot(snapshot_path: Path) -> dict[str, Any]:
+    """Load a previously saved snapshot from disk.
+
+    Args:
+        snapshot_path: Path to a JSON snapshot file produced by
+            :func:`save_snapshot`.
+
+    Returns:
+        The snapshot dict, including the ``schema`` and any metadata
+        that was stored alongside it.
+
+    Raises:
+        FileNotFoundError: If *snapshot_path* does not exist.
+        ValueError: If the file exists but cannot be parsed as JSON.
+    """
+    if not snapshot_path.exists():
+        raise FileNotFoundError(f"Snapshot file not found: {snapshot_path}")
+    try:
+        return json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Could not parse snapshot file {snapshot_path}: {exc}") from exc
+
+
 def save_snapshot(
     schema: dict[str, Any],
     label: str | None = None,
@@ -96,55 +125,4 @@ def save_snapshot(
     label so snapshots sort chronologically and are easy to identify.
 
     Args:
-        schema:       The schema dict produced by :func:`get_schema`.
-        label:        Optional short label embedded in the filename.
-        snapshot_dir: Directory where snapshot files are stored.
-
-    Returns:
-        The :class:`~pathlib.Path` of the written snapshot file.
-    """
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    fingerprint = schema_fingerprint(schema)
-    slug = f"_{label}" if label else ""
-    filename = snapshot_dir / f"{timestamp}{slug}_{fingerprint}.json"
-
-    payload = {
-        "captured_at": timestamp,
-        "label": label,
-        "fingerprint": fingerprint,
-        "schema": schema,
-    }
-
-    with filename.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2)
-
-    return filename
-
-
-def load_snapshot(path: Path) -> dict[str, Any]:
-    """Load and return the contents of a snapshot file.
-
-    Args:
-        path: Path to a JSON snapshot file.
-
-    Returns:
-        The full snapshot payload dict (including metadata and schema).
-
-    Raises:
-        FileNotFoundError: If *path* does not exist.
-        ValueError: If the file is not valid JSON or missing expected keys.
-    """
-    if not path.exists():
-        raise FileNotFoundError(f"Snapshot file not found: {path}")
-
-    with path.open("r", encoding="utf-8") as fh:
-        payload = json.load(fh)
-
-    required_keys = {"captured_at", "fingerprint", "schema"}
-    missing = required_keys - payload.keys()
-    if missing:
-        raise ValueError(f"Snapshot file is missing keys: {missing}")
-
-    return payload
+        schema:       The schema dict produced by
