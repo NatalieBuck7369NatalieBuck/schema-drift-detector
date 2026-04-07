@@ -40,6 +40,18 @@ Export an annotated changelog to a file:
 sdd diff --db postgresql://user:pass@localhost/mydb --against baseline --output changelog.md
 ```
 
+List all stored snapshots:
+
+```bash
+sdd snapshots list
+```
+
+Delete a snapshot by label:
+
+```bash
+sdd snapshots delete --label baseline
+```
+
 **Example output:**
 
 ```
