@@ -98,48 +98,13 @@ def diff_cmd(snapshot_a: Path, snapshot_b: Path, output_format: str, output: str
 
     report = generate_changelog(diff, fmt=output_format)
 
-    if output:
-        Path(output).write_text(report, encoding="utf-8")
-        click.secho(f"Report written to {output}", fg="green")
+    if output is not None:
+        output_path = Path(output)
+        try:
+            output_path.write_text(report, encoding="utf-8")
+            click.secho(f"Report written to: {output_path}", fg="green")
+        except OSError as exc:
+            click.secho(f"Error writing report to file: {exc}", fg="red", err=True)
+            sys.exit(1)
     else:
         click.echo(report)
-
-
-@cli.command("history")
-@click.option(
-    "--snapshots-dir",
-    default="./snapshots",
-    show_default=True,
-    help="Directory containing schema snapshots.",
-)
-def history_cmd(snapshots_dir: str):
-    """List all captured snapshots with timestamps and labels."""
-    snapshots_path = Path(snapshots_dir)
-    if not snapshots_path.exists():
-        click.secho(f"Snapshots directory not found: {snapshots_dir}", fg="red", err=True)
-        sys.exit(1)
-
-    snapshot_files = sorted(snapshots_path.glob("*.json"))
-    if not snapshot_files:
-        click.echo("No snapshots found.")
-        return
-
-    click.echo(f"{'#':<4} {'Filename':<40} {'Captured At':<25} {'Label'}")
-    click.echo("-" * 80)
-    for idx, path in enumerate(snapshot_files, start=1):
-        try:
-            snap = load_snapshot(path)
-            captured_at = snap.get("captured_at", "unknown")
-            label = snap.get("label") or "-"
-        except Exception:
-            captured_at, label = "(unreadable)", "-"
-        click.echo(f"{idx:<4} {path.name:<40} {captured_at:<25} {label}")
-
-
-def main():
-    """Package entry point."""
-    cli()
-
-
-if __name__ == "__main__":
-    main()
