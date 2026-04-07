@@ -28,7 +28,18 @@ class ConnectionError(Exception):  # noqa: A001
 
 
 def _detect_dialect(url: str) -> str:
-    """Return the dialect string ('postgresql' or 'sqlite') from a URL."""
+    """Return the dialect string ('postgresql' or 'sqlite') from a URL.
+
+    Args:
+        url: A database connection URL, e.g. ``postgresql://user:pass@host/db``
+             or ``sqlite:///path/to/db.sqlite3``.
+
+    Returns:
+        One of ``'postgresql'`` or ``'sqlite'``.
+
+    Raises:
+        UnsupportedDialectError: If the URL scheme is not recognised.
+    """
     scheme = urlparse(url).scheme.lower()
     if scheme in ("postgresql", "postgres", "pg"):
         return "postgresql"
@@ -76,7 +87,20 @@ _PG_INDEXES_SQL = """
 
 
 def _introspect_postgresql(url: str) -> Dict[str, Any]:
-    """Return a schema dict for a PostgreSQL database."""
+    """Return a schema dict for a PostgreSQL database.
+
+    Args:
+        url: A ``postgresql://`` connection URL.
+
+    Returns:
+        A dict with keys ``'tables'`` and ``'indexes'``, where ``'tables'``
+        maps table names to lists of column metadata dicts and ``'indexes'``
+        maps table names to lists of index metadata dicts.
+
+    Raises:
+        ImportError: If *psycopg2* is not installed.
+        ConnectionError: If the database cannot be reached.
+    """
     if not HAS_PSYCOPG2:
         raise ImportError(
             "psycopg2 is required for PostgreSQL support. "
@@ -93,100 +117,3 @@ def _introspect_postgresql(url: str) -> Dict[str, Any]:
             cur.execute(_PG_COLUMNS_SQL)
             for row in cur.fetchall():
                 tbl = row["table_name"]
-                schema["tables"].setdefault(tbl, {"columns": {}})
-                schema["tables"][tbl]["columns"][row["column_name"]] = {
-                    "type": row["data_type"],
-                    "max_length": row["character_maximum_length"],
-                    "nullable": row["is_nullable"] == "YES",
-                    "default": row["column_default"],
-                }
-
-            cur.execute(_PG_INDEXES_SQL)
-            for row in cur.fetchall():
-                tbl = row["table_name"]
-                schema["indexes"].setdefault(tbl, {})
-                schema["indexes"][tbl][row["index_name"]] = {
-                    "unique": row["is_unique"],
-                    "columns": list(row["columns"]),
-                }
-    conn.close()
-    return schema
-
-
-# ---------------------------------------------------------------------------
-# SQLite introspection
-# ---------------------------------------------------------------------------
-
-def _introspect_sqlite(url: str) -> Dict[str, Any]:
-    """Return a schema dict for a SQLite database."""
-    # Accept both 'sqlite:///path' and bare file paths.
-    parsed = urlparse(url)
-    db_path = parsed.path or parsed.netloc or url
-    if db_path.startswith("///"):
-        db_path = db_path[2:]  # keep leading /
-    elif db_path.startswith("//"):
-        db_path = db_path[2:]
-
-    try:
-        conn = sqlite3.connect(db_path)
-    except sqlite3.OperationalError as exc:
-        raise ConnectionError(f"Cannot open SQLite database '{db_path}': {exc}") from exc
-
-    schema: Dict[str, Any] = {"tables": {}, "indexes": {}}
-    cur = conn.cursor()
-
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
-    tables: List[str] = [row[0] for row in cur.fetchall() if row[0] != "sqlite_sequence"]
-
-    for tbl in tables:
-        schema["tables"][tbl] = {"columns": {}}
-        cur.execute(f"PRAGMA table_info('{tbl}');")
-        for col in cur.fetchall():
-            # cid, name, type, notnull, dflt_value, pk
-            schema["tables"][tbl]["columns"][col[1]] = {
-                "type": col[2],
-                "max_length": None,
-                "nullable": not bool(col[3]),
-                "default": col[4],
-            }
-
-        schema["indexes"][tbl] = {}
-        cur.execute(f"PRAGMA index_list('{tbl}');")
-        for idx in cur.fetchall():
-            # seq, name, unique, origin, partial
-            idx_name: str = idx[1]
-            cur.execute(f"PRAGMA index_info('{idx_name}');")
-            idx_cols = [r[2] for r in cur.fetchall()]
-            schema["indexes"][tbl][idx_name] = {
-                "unique": bool(idx[2]),
-                "columns": idx_cols,
-            }
-
-    conn.close()
-    return schema
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def introspect(url: str) -> Dict[str, Any]:
-    """Introspect a database and return its schema as a plain dictionary.
-
-    Parameters
-    ----------
-    url:
-        Database connection URL.  Examples::
-
-            postgresql://user:pass@localhost:5432/mydb
-            sqlite:///path/to/db.sqlite3
-
-    Returns
-    -------
-    dict
-        A nested dict with keys ``'tables'`` and ``'indexes'``.
-    """
-    dialect = _detect_dialect(url)
-    if dialect == "postgresql":
-        return _introspect_postgresql(url)
-    return _introspect_sqlite(url)
