@@ -70,6 +70,27 @@ sdd snapshots delete --label baseline
 
 ---
 
+## Configuration
+
+You can store connection and snapshot settings in a `.sdd.toml` file in your project root to avoid repeating flags on every command:
+
+```toml
+[database]
+url = "postgresql://user:pass@localhost/mydb"
+
+[snapshots]
+storage = ".sdd_snapshots"
+```
+
+With this file present, commands can be shortened:
+
+```bash
+sdd snapshot --label baseline
+sdd diff --against baseline
+```
+
+---
+
 ## License
 
 MIT © 2024 [yourname](https://github.com/yourname)
