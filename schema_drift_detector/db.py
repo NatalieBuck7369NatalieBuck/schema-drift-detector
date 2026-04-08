@@ -1,53 +1,50 @@
-"""Database connection and introspection utilities.
+"""Database introspection helpers for supported dialects.
 
-Supports PostgreSQL and SQLite backends. Provides a unified interface
-for extracting schema metadata (tables, columns, indexes, constraints)
-regardless of the underlying database engine.
+Currently supports PostgreSQL and SQLite. Extend `_DIALECT_MAP` and add
+an introspection function to support additional databases.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
 
 try:
     import psycopg2
     import psycopg2.extras
-    HAS_PSYCOPG2 = True
-except ImportError:
-    HAS_PSYCOPG2 = False
+    _PSYCOPG2_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _PSYCOPG2_AVAILABLE = False
 
 
 class UnsupportedDialectError(Exception):
-    """Raised when the database URL uses an unsupported dialect."""
+    """Raised when the connection URL uses an unrecognised database dialect."""
 
 
-class ConnectionError(Exception):  # noqa: A001
+class ConnectionError(Exception):  # noqa: A001  (shadows built-in intentionally)
     """Raised when a database connection cannot be established."""
 
 
+# ---------------------------------------------------------------------------
+# Dialect detection
+# ---------------------------------------------------------------------------
+
 def _detect_dialect(url: str) -> str:
-    """Return the dialect string ('postgresql' or 'sqlite') from a URL.
+    """Return a normalised dialect string from a connection *url*.
 
-    Args:
-        url: A database connection URL, e.g. ``postgresql://user:pass@host/db``
-             or ``sqlite:///path/to/db.sqlite3``.
-
-    Returns:
-        One of ``'postgresql'`` or ``'sqlite'``.
-
-    Raises:
-        UnsupportedDialectError: If the URL scheme is not recognised.
+    >>> _detect_dialect("postgresql://user:pw@localhost/db")
+    'postgresql'
+    >>> _detect_dialect("sqlite:///local.db")
+    'sqlite'
     """
-    scheme = urlparse(url).scheme.lower()
-    if scheme in ("postgresql", "postgres", "pg"):
+    lower = url.lower()
+    if lower.startswith(("postgresql://", "postgres://")):
         return "postgresql"
-    if scheme in ("sqlite", "sqlite3", ""):
+    if lower.startswith("sqlite://"):
         return "sqlite"
     raise UnsupportedDialectError(
-        f"Unsupported database dialect '{scheme}'. "
-        "Supported dialects: postgresql, sqlite."
+        f"Cannot determine dialect from URL: {url!r}. "
+        "Supported prefixes: postgresql://, postgres://, sqlite://"
     )
 
 
@@ -56,64 +53,136 @@ def _detect_dialect(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 _PG_COLUMNS_SQL = """
-    SELECT
-        c.table_name,
-        c.column_name,
-        c.data_type,
-        c.character_maximum_length,
-        c.is_nullable,
-        c.column_default
-    FROM information_schema.columns c
-    WHERE c.table_schema = 'public'
-    ORDER BY c.table_name, c.ordinal_position;
-"""
-
-_PG_INDEXES_SQL = """
-    SELECT
-        t.relname  AS table_name,
-        i.relname  AS index_name,
-        ix.indisunique AS is_unique,
-        array_agg(a.attname ORDER BY a.attnum) AS columns
-    FROM pg_class t
-    JOIN pg_index ix ON t.oid = ix.indrelid
-    JOIN pg_class i  ON i.oid = ix.indexrelid
-    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
-    JOIN pg_namespace n ON n.oid = t.relnamespace
-    WHERE n.nspname = 'public'
-      AND t.relkind = 'r'
-    GROUP BY t.relname, i.relname, ix.indisunique
-    ORDER BY t.relname, i.relname;
+SELECT
+    c.table_name,
+    c.column_name,
+    c.data_type,
+    c.character_maximum_length,
+    c.is_nullable,
+    c.column_default
+FROM information_schema.columns c
+JOIN information_schema.tables t
+    ON t.table_name = c.table_name
+   AND t.table_schema = c.table_schema
+WHERE c.table_schema = %s
+  AND t.table_type = 'BASE TABLE'
+ORDER BY c.table_name, c.ordinal_position;
 """
 
 
-def _introspect_postgresql(url: str) -> Dict[str, Any]:
+def _introspect_postgresql(url: str, schema: str = "public") -> Dict[str, Any]:
     """Return a schema dict for a PostgreSQL database.
 
-    Args:
-        url: A ``postgresql://`` connection URL.
+    Parameters
+    ----------
+    url:
+        A libpq-compatible connection string, e.g.
+        ``postgresql://user:pw@host:5432/dbname``.
+    schema:
+        The PostgreSQL schema (namespace) to introspect. Defaults to
+        ``"public"``.
 
-    Returns:
-        A dict with keys ``'tables'`` and ``'indexes'``, where ``'tables'``
-        maps table names to lists of column metadata dicts and ``'indexes'``
-        maps table names to lists of index metadata dicts.
-
-    Raises:
-        ImportError: If *psycopg2* is not installed.
-        ConnectionError: If the database cannot be reached.
+    Returns
+    -------
+    dict
+        ``{table_name: {column_name: {type, nullable, default, ...}}}``
     """
-    if not HAS_PSYCOPG2:
-        raise ImportError(
+    if not _PSYCOPG2_AVAILABLE:  # pragma: no cover
+        raise ConnectionError(
             "psycopg2 is required for PostgreSQL support. "
             "Install it with: pip install psycopg2-binary"
         )
     try:
         conn = psycopg2.connect(url)
-    except psycopg2.OperationalError as exc:
-        raise ConnectionError(f"Cannot connect to PostgreSQL: {exc}") from exc
+    except Exception as exc:  # psycopg2.OperationalError etc.
+        raise ConnectionError(f"Could not connect to PostgreSQL: {exc}") from exc
 
-    schema: Dict[str, Any] = {"tables": {}, "indexes": {}}
-    with conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(_PG_COLUMNS_SQL)
+    result: Dict[str, Any] = {}
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(_PG_COLUMNS_SQL, (schema,))
             for row in cur.fetchall():
-                tbl = row["table_name"]
+                table = row["table_name"]
+                col = row["column_name"]
+                result.setdefault(table, {})[col] = {
+                    "type": row["data_type"],
+                    "max_length": row["character_maximum_length"],
+                    "nullable": row["is_nullable"] == "YES",
+                    "default": row["column_default"],
+                }
+    finally:
+        conn.close()
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# SQLite introspection
+# ---------------------------------------------------------------------------
+
+def _introspect_sqlite(url: str) -> Dict[str, Any]:
+    """Return a schema dict for a SQLite database.
+
+    Parameters
+    ----------
+    url:
+        A SQLite connection URL of the form ``sqlite:///path/to/file.db``
+        or ``sqlite:///:memory:``.
+    """
+    # Strip the scheme prefix to get the raw file path.
+    path = url[len("sqlite:///"):] if url.startswith("sqlite:///") else ":memory:"
+    try:
+        conn = sqlite3.connect(path)
+    except sqlite3.OperationalError as exc:
+        raise ConnectionError(f"Could not open SQLite database {path!r}: {exc}") from exc
+
+    result: Dict[str, Any] = {}
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+        tables: List[str] = [row[0] for row in cur.fetchall()]
+        for table in tables:
+            cur.execute(f"PRAGMA table_info({table});")
+            columns = {}
+            for row in cur.fetchall():
+                # row: (cid, name, type, notnull, dflt_value, pk)
+                columns[row[1]] = {
+                    "type": row[2].upper() if row[2] else "TEXT",
+                    "max_length": None,
+                    "nullable": not bool(row[3]),
+                    "default": row[4],
+                }
+            result[table] = columns
+    finally:
+        conn.close()
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def introspect(url: str, pg_schema: str = "public") -> Dict[str, Any]:
+    """Introspect a database and return its schema as a plain dict.
+
+    Parameters
+    ----------
+    url:
+        Database connection URL.  Supported schemes: ``postgresql://``,
+        ``postgres://``, ``sqlite://``.
+    pg_schema:
+        PostgreSQL schema/namespace to inspect (ignored for SQLite).
+
+    Returns
+    -------
+    dict
+        ``{table_name: {column_name: {type, nullable, default, max_length}}}``
+    """
+    dialect = _detect_dialect(url)
+    if dialect == "postgresql":
+        return _introspect_postgresql(url, schema=pg_schema)
+    if dialect == "sqlite":
+        return _introspect_sqlite(url)
+    # Should be unreachable given _detect_dialect's guard, but keeps mypy happy.
+    raise UnsupportedDialectError(dialect)  # pragma: no cover
